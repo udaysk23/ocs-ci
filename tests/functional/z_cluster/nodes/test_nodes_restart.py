@@ -25,6 +25,7 @@ from ocs_ci.helpers.helpers import (
     storagecluster_independent_check,
 )
 from ocs_ci.ocs.ocp import OCP
+from ocs_ci.ocs.exceptions import ServiceUnavailable
 from ocs_ci.ocs.exceptions import CommandFailed
 from ocs_ci.utility.utils import retry
 from ocs_ci.ocs.cluster import is_vsphere_ipi_cluster
@@ -94,9 +95,9 @@ class TestNodesRestart(ManageTest):
             nodes.restart_nodes_by_stop_and_start(nodes=ocp_nodes, force=force)
 
         self.sanity_helpers.health_check()
-        self.sanity_helpers.create_resources(
-            pvc_factory, pod_factory, bucket_factory, rgw_bucket_factory
-        )
+        retry(ServiceUnavailable, tries=20, delay=30)(
+            self.sanity_helpers.create_resources
+        )(pvc_factory, pod_factory, bucket_factory, rgw_bucket_factory)
 
     @tier4b
     @bugzilla("1754287")
@@ -111,6 +112,7 @@ class TestNodesRestart(ManageTest):
         ocp_nodes = get_node_objs()
         for node in ocp_nodes:
             nodes.restart_nodes(nodes=[node], wait=False)
+            pod.wait_for_ceph_cmd_execute_successfully(timeout=420, num_of_retries=2)
             self.sanity_helpers.health_check(cluster_check=False, tries=60)
 
         retry(CommandFailed, tries=8, delay=40, backoff=1)(

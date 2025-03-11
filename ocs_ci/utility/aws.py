@@ -632,7 +632,7 @@ class AWS(object):
             cluster_name (str): Cluster name
 
         Returns:
-            string of space separated subnet ids
+            list: Subnet IDs str list
 
         """
         subnets = self.ec2_client.describe_subnets(
@@ -2194,6 +2194,25 @@ class AWS(object):
         logger.info("Deleting role %s policy: %s", role_name, policy_name)
         self.iam_client.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
 
+    def delete_oidc_provider(self, provider_name):
+        """
+        Deletes the OIDC provider
+
+        Args:
+            provider_name (str): OIDC provider name
+                e.g: d3gcnqtx1lgapn.cloudfront.net
+
+        """
+        account_id = self.get_caller_identity()
+        oidc_provider_arn = f"arn:aws:iam::{account_id}:oidc-provider/{provider_name}"
+        try:
+            self.iam_client.delete_open_id_connect_provider(
+                OpenIDConnectProviderArn=oidc_provider_arn
+            )
+            logger.info(f"Deleted OIDC provider: {oidc_provider_arn}")
+        except Exception as e:
+            logger.error(f"Error deleting OIDC provider: {e}")
+
     def get_caller_identity(self):
         """
         Get STS Caller Identity Account ID
@@ -2244,13 +2263,7 @@ def get_data_volumes(deviceset_pvs):
     aws = AWS()
 
     volume_ids = [
-        "vol-"
-        + pv.get()
-        .get("spec")
-        .get("awsElasticBlockStore")
-        .get("volumeID")
-        .partition("vol-")[-1]
-        for pv in deviceset_pvs
+        pv.get().get("spec").get("csi").get("volumeHandle") for pv in deviceset_pvs
     ]
     return [aws.ec2_resource.Volume(vol_id) for vol_id in volume_ids]
 
@@ -2552,6 +2565,7 @@ def create_and_attach_sts_role():
     namespace = config.ENV_DATA.get("cluster_namespace")
     service_account_name_1 = "noobaa"
     service_account_name_2 = "noobaa-endpoint"
+    service_account_name_3 = "noobaa-core"
     aws_account_id = aws.get_caller_identity()
     resp = exec_cmd("oc get authentication cluster -ojson")
     auth_cluster_dict = json.loads(resp.stdout)
@@ -2574,6 +2588,7 @@ def create_and_attach_sts_role():
                         f"{oidc_provider}:sub": [
                             f"system:serviceaccount:{namespace}:{service_account_name_1}",
                             f"system:serviceaccount:{namespace}:{service_account_name_2}",
+                            f"system:serviceaccount:{namespace}:{service_account_name_3}",
                         ]
                     }
                 },
@@ -2582,7 +2597,10 @@ def create_and_attach_sts_role():
     }
     logger.info("Trust Data: \n%s", trust_data)
     cluster_path = config.ENV_DATA["cluster_path"]
-    role_name = get_infra_id(cluster_path)
+    if config.ENV_DATA.get("platform") == constants.ROSA_HCP_PLATFORM:
+        role_name = f"{config.ENV_DATA['cluster_name']}"
+    else:
+        role_name = get_infra_id(cluster_path)
     description = f"Role created for {role_name} to support STS"
     role_data = aws.create_iam_role(role_name, description, json.dumps(trust_data))
     aws.attach_role_policy(role_name, policy_arn)
@@ -2595,9 +2613,13 @@ def delete_sts_iam_roles():
     """
     logger.info("Deleting STS IAM Roles")
     cluster_path = config.ENV_DATA["cluster_path"]
-    infra_id = get_infra_id(cluster_path)
     aws = AWS()
-    roles = aws.get_iam_roles(infra_id)
+    if config.ENV_DATA.get("platform") == constants.ROSA_HCP_PLATFORM:
+        role_name = f"{config.ENV_DATA['cluster_name']}"
+        roles = aws.get_iam_roles(role_name)
+    else:
+        infra_id = get_infra_id(cluster_path)
+        roles = aws.get_iam_roles(infra_id)
 
     for role in roles:
         role_name = role["RoleName"]
@@ -2613,3 +2635,24 @@ def delete_sts_iam_roles():
                 role_name, instance_profile["InstanceProfileName"]
             )
         aws.delete_iam_role(role_name)
+    auth_cluster = exec_cmd("oc get authentication cluster -o json")
+    auth_cluster_dict = json.loads(auth_cluster.stdout)
+    oidc_provider_name = auth_cluster_dict["spec"]["serviceAccountIssuer"].replace(
+        "https://", ""
+    )
+    aws.delete_oidc_provider(provider_name=oidc_provider_name)
+
+
+def delete_subnet_tags(tag, *subnet_ids):
+    """
+    Delete tag from subnet(s)
+    Default AWS account limitation is 50 tags per subnet
+
+    Args:
+        tag (str): Tag to delete
+        subnet_ids (str): One or more subnet IDs from which to delete the tag.
+    """
+    subnet_ids = [subnet_ids] if isinstance(subnet_ids, str) else list(subnet_ids)
+    logger.info(f"Deleting tag {tag} from subnet(s) {subnet_ids}")
+    aws = AWS()
+    aws.ec2_client.delete_tags(Resources=subnet_ids, Tags=[{"Key": tag}])

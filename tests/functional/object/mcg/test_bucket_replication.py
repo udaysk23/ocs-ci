@@ -1,4 +1,5 @@
 import logging
+import gc
 
 import pytest
 
@@ -10,6 +11,7 @@ from ocs_ci.framework.pytest_customization.marks import (
     red_squad,
     mcg,
     sts_deployment_required,
+    skipif_noobaa_external_pgsql,
 )
 from ocs_ci.ocs.exceptions import CommandFailed
 from ocs_ci.framework.testlib import MCGTest
@@ -360,6 +362,7 @@ class TestReplication(MCGTest):
             mcg_obj_session, first_bucket_name, second_bucket_name, timeout=self.TIMEOUT
         ), f"Objects in the buckets {first_bucket_name} and {second_bucket_name} are not same"
 
+    @skipif_noobaa_external_pgsql
     @pytest.mark.parametrize(
         argnames=["source_bucketclass", "target_bucketclass"],
         argvalues=[
@@ -490,11 +493,14 @@ class TestReplication(MCGTest):
 
             def check_nb_endpoint_logs():
                 for pod in get_noobaa_endpoint_pods():
+                    pod_logs = get_pod_logs(pod.name)
                     if (
                         "The AWS access key Id you provided does not exist in our records"
-                        in get_pod_logs(pod.name)
+                        in pod_logs
                     ):
                         return True
+                    del pod_logs
+                    gc.collect()
                 return False
 
             sample = TimeoutSampler(timeout=360, sleep=10, func=check_nb_endpoint_logs)
@@ -519,12 +525,13 @@ class TestReplication(MCGTest):
 
             # check in noobaa core logs
             def check_noobaa_core_logs():
-                if "find_rules_updated_longest_time_ago:  []" in get_pod_logs(
-                    get_noobaa_core_pod().name
-                ):
-                    return True
-                else:
-                    return False
+                found = False
+                pod_logs = get_pod_logs(get_noobaa_core_pod().name)
+                if "find_rules_updated_longest_time_ago:  []" in pod_logs:
+                    found = True
+                del pod_logs
+                gc.collect()
+                return found
 
             logger.info(
                 f"Checking the noobaa core logs to see if the replication has "

@@ -27,7 +27,11 @@ from ocs_ci.ocs.node import (
 )
 from ocs_ci.ocs.cluster import validate_existence_of_blocking_pdb
 from ocs_ci.framework import config
-from ocs_ci.framework.pytest_customization.marks import brown_squad
+from ocs_ci.framework.pytest_customization.marks import (
+    brown_squad,
+    skipif_rosa_hcp,
+    skipif_compact_mode,
+)
 from ocs_ci.framework.testlib import (
     tier1,
     tier2,
@@ -128,7 +132,10 @@ class TestNodesMaintenance(ManageTest):
         argnames=["node_type"],
         argvalues=[
             pytest.param(*["worker"], marks=pytest.mark.polarion_id("OCS-1269")),
-            pytest.param(*["master"], marks=pytest.mark.polarion_id("OCS-1272")),
+            pytest.param(
+                *["master"],
+                marks=[pytest.mark.polarion_id("OCS-1272"), skipif_rosa_hcp],
+            ),
         ],
     )
     def test_node_maintenance(
@@ -255,6 +262,8 @@ class TestNodesMaintenance(ManageTest):
         wait_for_nodes_status(
             node_names=[typed_node_name],
             status=constants.NODE_READY_SCHEDULING_DISABLED,
+            timeout=600,
+            sleep=20,
         )
 
         # Mark the node back to schedulable
@@ -274,7 +283,10 @@ class TestNodesMaintenance(ManageTest):
         argnames=["nodes_type"],
         argvalues=[
             pytest.param(*["worker"], marks=pytest.mark.polarion_id("OCS-1273")),
-            pytest.param(*["master"], marks=pytest.mark.polarion_id("OCS-1271")),
+            pytest.param(
+                *["master"],
+                marks=[pytest.mark.polarion_id("OCS-1271"), skipif_rosa_hcp],
+            ),
         ],
     )
     def test_2_nodes_maintenance_same_type(self, nodes_type):
@@ -303,6 +315,7 @@ class TestNodesMaintenance(ManageTest):
 
     @tier2
     @pytest.mark.polarion_id("OCS-1274")
+    @skipif_compact_mode
     def test_2_nodes_different_types(
         self, pvc_factory, pod_factory, bucket_factory, rgw_bucket_factory
     ):
