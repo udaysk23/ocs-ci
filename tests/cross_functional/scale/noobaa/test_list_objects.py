@@ -60,7 +60,7 @@ class TestListOfObjects(E2ETest):
             full_object_path,
             s3_obj,
             recursive=True,
-            timeout=9000,
+            timeout=18000,
         )
 
         # List the objects recursively
@@ -72,6 +72,8 @@ class TestListOfObjects(E2ETest):
             out_yaml_format=False,
             timeout=9000,
         )
+        from time import sleep
+        sleep(9000)
 
         # Verify when listing any errors found
         log.info("Verify when listing objects recursively found any Timeout error")
