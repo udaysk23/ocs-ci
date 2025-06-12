@@ -938,11 +938,19 @@ def ocs_install_verification(
     log.info("Verified the ownerReferences CSI plugin daemonsets")
     log.info("Verifying the providerAPIServerServiceType setting in StorageCluster")
     sc_obj = get_storage_cluster()
-    if sc_obj.get().get("items")[0].get("spec").get("hostNetwork"):
+    sc_ob_spec = sc_obj.get().get("items")[0].get("spec")
+    if sc_ob_spec.get("hostNetwork") is True:
         assert (
-            sc_obj.get().get("items")[0].get("spec").get("providerAPIServerServiceType")
+            sc_ob_spec.get("providerAPIServerServiceType")
             == constants.SERVICE_TYPE_NODEPORT
         ), f"Provider API server service type is not {constants.SERVICE_TYPE_NODEPORT}"
+        # check the rule in bz DFBUGS-2324 is followed:
+        assert (
+            sc_ob_spec.get("managedResources", {})
+            .get("cephObjectStores", {})
+            .get("hostNetwork", True)
+            is False
+        ), "Host network is not set to False for cephObjectStores when spec.hostNetwork is True"
     log.info("Verified the providerAPIServerServiceType setting in StorageCluster")
     log.info("Verifying the csi driver ownership")
     csi_driver_list = [constants.RBD_PROVISIONER, constants.CEPHFS_PROVISIONER]
@@ -1902,7 +1910,8 @@ def set_deviceset_count(count):
 
 def get_storage_cluster(namespace=None):
     """
-    Get storage cluster name
+    Get storage cluster object
+    (from provider cluster if run on multicluster environment)
 
     Args:
         namespace (str): Namespace of the resource
@@ -1911,9 +1920,10 @@ def get_storage_cluster(namespace=None):
         storage cluster (obj) : Storage cluster object handler
 
     """
-    if namespace is None:
-        namespace = config.ENV_DATA["cluster_namespace"]
-    sc_obj = OCP(kind=constants.STORAGECLUSTER, namespace=namespace)
+    with config.RunWithProviderConfigContextIfAvailable():
+        if namespace is None:
+            namespace = config.ENV_DATA["cluster_namespace"]
+        sc_obj = OCP(kind=constants.STORAGECLUSTER, namespace=namespace)
     return sc_obj
 
 
@@ -3046,14 +3056,14 @@ def get_client_storage_provider_endpoint():
 
 def wait_for_storage_client_connected(timeout=180, sleep=10):
     """
-    Wait for the storage-client to be in a connected phase
+    Wait for the Storage client to be in a connected phase
 
     Args:
-        timeout (int): Time to wait for the storage-client to be in a connected phase
+        timeout (int): Time to wait for the Storage Client to be in a connected phase
         sleep (int): Time in seconds to sleep between attempts
 
     Raises:
-        ResourceWrongStatusException: In case the storage-client didn't reach the desired connected phase
+        ResourceWrongStatusException: In case the Storage Client didn't reach the desired connected phase
 
     """
     sc_obj = OCP(

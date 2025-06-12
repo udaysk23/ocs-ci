@@ -33,7 +33,7 @@ from ocs_ci.utility.utils import (
     exec_nb_db_query,
     exec_cmd,
 )
-from ocs_ci.helpers.helpers import create_resource
+from ocs_ci.helpers.helpers import create_resource, remove_port_from_url
 from ocs_ci.utility import version
 
 logger = logging.getLogger(__name__)
@@ -55,9 +55,16 @@ def craft_s3_command(cmd, mcg_obj=None, api=False, signed_request_creds=None):
 
     """
     api = "api" if api else ""
+    # TODO(fbalak): generate correct ssl certificate for multicluster scenarios that use external endpoint
     no_ssl = (
         "--no-verify-ssl"
-        if (signed_request_creds and signed_request_creds.get("ssl")) is False
+        if (
+            (signed_request_creds and signed_request_creds.get("ssl")) is False
+            or (
+                config.multicluster
+                and not config.DEPLOYMENT.get("use_custom_ingress_ssl_cert")
+            )
+        )
         else ""
     )
     if mcg_obj:
@@ -166,32 +173,34 @@ def craft_s3cmd_command(cmd, mcg_obj=None, signed_request_creds=None):
 
     """
     no_ssl = "--no-ssl"
+
     if mcg_obj:
-        if mcg_obj.region:
-            region = f"--region={mcg_obj.region} "
-        else:
-            region = ""
+        signed_request_creds = {
+            "access_key_id": mcg_obj.access_key_id,
+            "access_key": mcg_obj.access_key,
+            "endpoint": mcg_obj.s3_endpoint,
+            "region": mcg_obj.region,
+        }
+
+    if signed_request_creds:
+        access_key_id = signed_request_creds.get("access_key_id")
+        access_key = signed_request_creds.get("access_key")
+        endpoint = signed_request_creds.get("endpoint")
+        region = signed_request_creds.get("region")
+
+        # s3cmd doesn't support port suffix under host
+        endpoint = remove_port_from_url(endpoint)
+
         base_command = (
-            f"s3cmd --access_key={mcg_obj.access_key_id} "
-            f"--secret_key={mcg_obj.access_key} "
-            f"{region}"
-            f"--host={mcg_obj.s3_external_endpoint} "
-            f"--host-bucket={mcg_obj.s3_external_endpoint} "
+            "s3cmd "
+            f"--access_key={access_key_id} "
+            f"--secret_key={access_key} "
+            f"--host={endpoint} "
+            f"--host-bucket={endpoint} "
             f"{no_ssl} "
         )
-    elif signed_request_creds:
-        if signed_request_creds.get("region"):
-            region = f'--region={signed_request_creds.get("region")} '
-        else:
-            region = ""
-        base_command = (
-            f's3cmd --access_key={signed_request_creds.get("access_key_id")} '
-            f'--secret_key={signed_request_creds.get("access_key")} '
-            f"{region}"
-            f'--host={signed_request_creds.get("endpoint")} '
-            f'--host-bucket={signed_request_creds.get("endpoint")} '
-            f"{no_ssl} "
-        )
+        base_command += f"--region={region} " if region else ""
+
     else:
         base_command = f"s3cmd {no_ssl}"
 
@@ -2143,6 +2152,24 @@ def update_replication_policy(bucket_name, replication_policy_dict):
     ).patch(params=json.dumps(replication_policy_patch_dict), format_type="merge")
 
 
+def get_replication_policy(bucket_name):
+    """
+    Get the replication policy on a bucket
+
+    Args:
+        bucket_name (str): Name of the bucket
+
+    Returns:
+        Dict: replication policy
+
+    """
+    return OCP(
+        kind="obc",
+        namespace=config.ENV_DATA["cluster_namespace"],
+        resource_name=bucket_name,
+    ).get()["spec"]["additionalConfig"]["replicationPolicy"]
+
+
 def patch_replication_policy_to_bucketclass(
     bucketclass_name, rule_id, destination_bucket_name
 ):
@@ -2442,7 +2469,7 @@ def expire_objects_in_bucket(bucket_name, object_keys=[], prefix=""):
 
 def expire_multipart_upload_in_noobaa_db(upload_id):
     """
-    Expire a multipart upload by changing its creation date to one year back.
+    Expire a multipart upload and its parts by changing their creation date to one year back.
 
     Args:
         upload_id (str): The ID of the multipart upload to expire (unique across all buckets)
@@ -2453,8 +2480,11 @@ def expire_multipart_upload_in_noobaa_db(upload_id):
     # and that ID's first 8 characters are the initial timestamp
     # in hex
 
-    # first two characters of the hex are 0x
-    new_upload_started = hex(int(one_year_ago))[2:] + upload_id[8:]
+    # The first two characters in the python hex representation are "0x"
+    one_year_ago_hex_str = hex(int(one_year_ago))[2:]
+
+    # Concatenate the new timestamp with the rest of the ID
+    new_upload_started = one_year_ago_hex_str + upload_id[8:]
 
     psql_query = (
         "UPDATE objectmds "
@@ -2463,6 +2493,15 @@ def expire_multipart_upload_in_noobaa_db(upload_id):
         f"WHERE _id = '{upload_id}'"
     )
     psql_query += ";"
+    exec_nb_db_query(psql_query)
+
+    # Expire the parts as well
+    psql_query = (
+        "UPDATE objectmultiparts "
+        "SET data = jsonb_set(data, '{create_time}', "
+        f"to_jsonb(to_timestamp({one_year_ago}))) "
+        f"WHERE data->>'obj' = '{upload_id}';"
+    )
     exec_nb_db_query(psql_query)
 
 
@@ -2855,6 +2894,56 @@ def bulk_s3_put_bucket_lifecycle_config(mcg_obj, buckets, lifecycle_config):
     logger.info("Applied lifecyle rule on all the buckets")
 
 
+def upload_random_objects_to_source_and_wait_for_replication(
+    mcg_obj,
+    source_bucket,
+    target_bucket,
+    mockup_logger,
+    file_dir,
+    pattern="ObjKey-",
+    amount=1,
+    num_versions=1,
+    prefix=None,
+    timeout=600,
+):
+    """
+    Upload randomly generated objects to the source bucket and wait until the
+    replication happens
+
+    Args:
+        mcg_obj (MCG): MCG object
+        source_bucket (OBC): OBC object
+        target_bucket (OBC): OBC object
+        mockup_logger (MockupLogger): MockupLogger object
+        file_dir (str): File directory where to generate objects
+        pattern (str): Prefix for object name
+        amount (int): Number of objects
+        num_verions (int): Number of versions of each object
+        prefix (str): Prefix under bucket where objects need to be uploaded
+        timeout (int): Timeout to wait until the replication
+
+    """
+
+    logger.info(f"Randomly generating {amount} object/s")
+    for _ in range(num_versions):
+        obj_list = write_random_objects_in_pod(
+            io_pod=mockup_logger.awscli_pod,
+            file_dir=file_dir,
+            amount=amount,
+            pattern=pattern,
+        )
+
+        mockup_logger.upload_random_objects_and_log(
+            source_bucket.name, file_dir=file_dir, obj_list=obj_list, prefix=prefix
+        )
+    assert compare_bucket_object_list(
+        mcg_obj,
+        source_bucket.name,
+        target_bucket.name,
+        timeout=timeout,
+    ), f"Standard replication failed to complete in {timeout} seconds"
+
+
 def upload_test_objects_to_source_and_wait_for_replication(
     mcg_obj, source_bucket, target_bucket, mockup_logger, timeout
 ):
@@ -3147,7 +3236,6 @@ def get_obj_versions(mcg_obj, awscli_pod, bucket_name, obj_key):
         # Remove quotes from the ETag values for easier usage
         for d in versions_dicts:
             d["ETag"] = d["ETag"].strip('"')
-
     return versions_dicts
 
 
@@ -3356,3 +3444,34 @@ def delete_all_objects_in_batches(
         batch_deleter.delete_in_parallel()
     else:
         batch_deleter.delete_sequentially()
+
+
+def verify_soft_deletion(mcg_obj, awscli_pod, bucket_name, object_key):
+    """
+    Verify if deletion marker exists and IsLatest for the given object key
+
+    Args:
+        mcg_obj (MCG): MCG object
+        awscli_pod (Pod): Pod object where AWS CLI is installed
+        bucket_name (str): Name of the bucket
+        object_key (str): Object key
+
+    Returns:
+        True if DeletionMarkers exists else False
+
+    """
+    resp = awscli_pod.exec_cmd_on_pod(
+        command=craft_s3_command(
+            f"list-object-versions --bucket {bucket_name} --prefix {object_key}",
+            mcg_obj=mcg_obj,
+            api=True,
+        ),
+        out_yaml_format=False,
+    )
+
+    if resp and "DeleteMarkers" in resp:
+        delete_markers = json.loads(resp).get("DeleteMarkers")[0]
+        logger.info(f"{bucket_name}:\n{delete_markers}")
+        if delete_markers.get("IsLatest"):
+            return True
+    return False

@@ -472,65 +472,109 @@ class Deployment(object):
         """
         if config.ENV_DATA.get("skip_dr_deployment", False):
             return
+
+        def version_exist(pm, required_version):
+            """
+            Check if the given PackageManifest includes the specified OADP version.
+
+            Args:
+                pm (dict): The PackageManifest data as a dictionary.
+                required_version (str): The OADP version to look for (e.g., "1.5").
+
+            Returns:
+                bool: True if the version exists in any channel's entries, False otherwise.
+
+            """
+            for channel in pm.get("status", {}).get("channels", []):
+                for entry in channel.get("entries", []):
+                    entry_version = entry.get("version")
+                    if entry_version and version.get_semantic_version(
+                        entry_version, only_major_minor=True
+                    ) == version.get_semantic_version(
+                        required_version, only_major_minor=True
+                    ):
+                        return True
+            return False
+
         if config.multicluster:
-            managed_clusters = get_non_acm_cluster_config()
-            for cluster in managed_clusters:
+            for cluster in config.clusters:
                 index = cluster.MULTICLUSTER["multicluster_index"]
-                config.switch_ctx(index)
-                logger.info("Creating Namespace")
-                # creating Namespace and operator group for cert-manager
-                logger.info("Creating namespace and operator group for Openshift-oadp")
-                run_cmd(f"oc create -f {constants.OADP_NS_YAML}")
-                logger.info("Creating OADP Operator Subscription")
-                oadp_subscription_yaml_data = templating.load_yaml(
-                    constants.OADP_SUBSCRIPTION_YAML
-                )
-                package_manifest = PackageManifest(
-                    resource_name=constants.OADP_OPERATOR_NAME,
-                    selector="catalog=redhat-operators",
-                )
-                try:
-                    package_manifest.get()
-                except ResourceNotFoundError as ex:
-                    logger.warning(
-                        f"OADP operator not availabe - bringing up unreleased content {ex}!"
+                with config.RunWithConfigContext(index):
+                    config.switch_ctx(index)
+                    logger.info("Creating Namespace")
+                    # creating Namespace and operator group for cert-manager
+                    logger.info(
+                        "Creating namespace and operator group for Openshift-oadp"
                     )
-                    create_unreleased_oadp_catalog()
+                    run_cmd(f"oc create -f {constants.OADP_NS_YAML}")
+                    logger.info("Creating OADP Operator Subscription")
+                    oadp_subscription_yaml_data = templating.load_yaml(
+                        constants.OADP_SUBSCRIPTION_YAML
+                    )
                     package_manifest = PackageManifest(
                         resource_name=constants.OADP_OPERATOR_NAME,
-                        selector=f"catalog={constants.BREW_CATALOG_NAME}",
+                        selector="catalog=redhat-operators",
                     )
-                    oadp_subscription_yaml_data["spec"][
-                        "source"
-                    ] = constants.BREW_CATALOG_NAME
-                oadp_default_channel = package_manifest.get_default_channel()
+                    try:
+                        pm_data = package_manifest.get()
+                        pm_list = pm_data if isinstance(pm_data, list) else [pm_data]
+                        required_oadp_version = config.ENV_DATA["oadp_version"]
 
-                oadp_subscription_yaml_data["spec"]["channel"] = oadp_default_channel
-                oadp_subscription_manifest = tempfile.NamedTemporaryFile(
-                    mode="w+", prefix="oadp_subscription_manifest", delete=False
-                )
-                templating.dump_data_to_temp_yaml(
-                    oadp_subscription_yaml_data, oadp_subscription_manifest.name
-                )
-                run_cmd(f"oc create -f {oadp_subscription_manifest.name}")
-                self.wait_for_subscription(
-                    constants.OADP_OPERATOR_NAME, namespace=constants.OADP_NAMESPACE
-                )
-                logger.info(
-                    "Sleeping for 120 seconds after subscribing to OADP Operator"
-                )
-                time.sleep(120)
-                oadp_subscriptions = ocp.OCP(
-                    kind=constants.SUBSCRIPTION_WITH_ACM,
-                    resource_name=constants.OADP_OPERATOR_NAME,
-                    namespace=constants.OADP_NAMESPACE,
-                ).get()
-                oadp_csv_name = oadp_subscriptions["status"]["currentCSV"]
-                csv = CSV(
-                    resource_name=oadp_csv_name, namespace=constants.OADP_NAMESPACE
-                )
-                csv.wait_for_phase("Succeeded", timeout=720)
-                logger.info("OADP Operator Deployment Succeeded")
+                        if not any(
+                            version_exist(pm, required_oadp_version)
+                            and pm.get("status", {}).get("catalogSource")
+                            == constants.OPERATOR_CATALOG_SOURCE_NAME
+                            for pm in pm_list
+                        ):
+                            raise ResourceNotFoundError(
+                                f"Didn't find OADP {required_oadp_version}"
+                            )
+
+                    except ResourceNotFoundError as ex:
+                        logger.warning(
+                            f"OADP operator not availabe - bringing up unreleased content {ex}!"
+                        )
+                        create_unreleased_oadp_catalog()
+                        package_manifest = PackageManifest(
+                            resource_name=constants.OADP_OPERATOR_NAME,
+                            selector=f"catalog={constants.OADP_CATALOG_NAME}",
+                        )
+                        oadp_subscription_yaml_data["spec"][
+                            "source"
+                        ] = constants.OADP_CATALOG_NAME
+                    oadp_default_channel = package_manifest.get_default_channel()
+                    if config.MULTICLUSTER["acm_cluster"]:
+                        logger.info("Skipping oadp subscription for ACM hub")
+                        continue
+
+                    oadp_subscription_yaml_data["spec"][
+                        "channel"
+                    ] = oadp_default_channel
+                    oadp_subscription_manifest = tempfile.NamedTemporaryFile(
+                        mode="w+", prefix="oadp_subscription_manifest", delete=False
+                    )
+                    templating.dump_data_to_temp_yaml(
+                        oadp_subscription_yaml_data, oadp_subscription_manifest.name
+                    )
+                    run_cmd(f"oc create -f {oadp_subscription_manifest.name}")
+                    self.wait_for_subscription(
+                        constants.OADP_OPERATOR_NAME, namespace=constants.OADP_NAMESPACE
+                    )
+                    logger.info(
+                        "Sleeping for 120 seconds after subscribing to OADP Operator"
+                    )
+                    time.sleep(120)
+                    oadp_subscriptions = ocp.OCP(
+                        kind=constants.SUBSCRIPTION_WITH_ACM,
+                        resource_name=constants.OADP_OPERATOR_NAME,
+                        namespace=constants.OADP_NAMESPACE,
+                    ).get()
+                    oadp_csv_name = oadp_subscriptions["status"]["currentCSV"]
+                    csv = CSV(
+                        resource_name=oadp_csv_name, namespace=constants.OADP_NAMESPACE
+                    )
+                    csv.wait_for_phase("Succeeded", timeout=720)
+                    logger.info("OADP Operator Deployment Succeeded")
 
     def do_deploy_rdr(self):
         """
@@ -1331,11 +1375,29 @@ class Deployment(object):
             if all(
                 key in config.DEPLOYMENT for key in ("csv_change_from", "csv_change_to")
             ):
-                modify_csv(
-                    csv=csv_name,
-                    replace_from=config.DEPLOYMENT["csv_change_from"],
-                    replace_to=config.DEPLOYMENT["csv_change_to"],
-                )
+                # In case someone uses old approach passed via string for one image only
+                # directly via config.
+                if isinstance(config.DEPLOYMENT["csv_change_from"], str):
+                    zipped_csv_changes = [
+                        (
+                            config.DEPLOYMENT["csv_change_from"],
+                            config.DEPLOYMENT["csv_change_to"],
+                        ),
+                    ]
+                else:
+                    zipped_csv_changes = zip(
+                        config.DEPLOYMENT["csv_change_from"],
+                        config.DEPLOYMENT["csv_change_to"],
+                    )
+                for csv_change_from, csv_change_to in zipped_csv_changes:
+                    csvs = CSV(namespace=self.namespace)
+                    csv_list = csvs.get()["items"]
+                    for _csv in csv_list:
+                        modify_csv(
+                            csv=_csv["metadata"]["name"],
+                            replace_from=csv_change_from,
+                            replace_to=csv_change_to,
+                        )
 
         if is_storage_system_needed():
             logger.info("Creating StorageSystem")
@@ -3541,6 +3603,16 @@ class MultiClusterDROperatorsDeploy(object):
         oadp_data["spec"]["backupLocations"][0]["velero"]["objectStorage"][
             "bucket"
         ] = bucket_name
+        oadp_version = get_oadp_version(namespace=constants.ACM_HUB_BACKUP_NAMESPACE)
+        if version.compare_versions(f"{oadp_version} >= 1.5"):
+            # Remove 'restic' under 'configuration' if it exists
+            oadp_data["spec"]["configuration"].pop("restic", None)
+
+            # Add 'nodeAgent' under 'configuration'
+            oadp_data["spec"]["configuration"]["nodeAgent"] = {
+                "enable": True,
+                "uploaderType": "restic",
+            }
         oadp_yaml = tempfile.NamedTemporaryFile(mode="w+", prefix="oadp", delete=False)
         templating.dump_data_to_temp_yaml(oadp_data, oadp_yaml.name)
         run_cmd(f"oc create -f {oadp_yaml.name}")
