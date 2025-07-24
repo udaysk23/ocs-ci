@@ -318,7 +318,7 @@ class OCP(object):
 
         """
         if not cluster_config:
-            cluster_config = config
+            cluster_config = self.cluster_kubeconfig
         resource_name = resource_name if resource_name else self.resource_name
         selector = selector if selector else self.selector
         field_selector = field_selector if field_selector else self.field_selector
