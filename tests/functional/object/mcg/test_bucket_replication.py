@@ -502,12 +502,13 @@ class TestReplication(MCGTest):
             # delete the bucket
             source_bucket.delete()
             logger.info(f"Deleted source bucket {source_bucket_name}")
+            import time
+            time.sleep(300)
 
             # check in db that the replication config was deleted
             replication_conf_count = exec_nb_db_query(
                 f"SELECT COUNT (*) FROM replicationconfigs WHERE _id='{replication_id}'"
             )[0].strip()
-
             assert (
                 int(replication_conf_count) == 0
             ), f"Replication config for {source_bucket_name} is not deleted!"
