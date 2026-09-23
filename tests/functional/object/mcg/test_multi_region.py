@@ -88,7 +88,6 @@ class TestMultiRegion(MCGTest):
     @tier4a
     @skipif_ocs_version("==4.4")
     @pytest.mark.polarion_id("OCS-1784")
-    @jira("DFBUGS-9429")
     def test_multiregion_mirror(
         self,
         cld_mgr,
